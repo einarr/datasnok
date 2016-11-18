@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+
+import argparse
+import glob
+import logging
+import json
+import os.path
+import pyinotify
+import re
+import sys
+
+from matrix_client.client import MatrixClient
+from matrix_client.api import MatrixRequestError
+from requests.exceptions import MissingSchema
+
+class PathMatch(dict):
+    def __init__(self, *args):
+        dict.__init__(self, *args)
+        self.match = False
+        self.incomplete_path = False
+        self.incomplete_pattern = False
+
+
+def match_path(pattern, path):
+    """Matches a path against a pattern. Returns a PathMatch object.
+
+       Matches a path string against a pattern string, returning a PathMatch dict
+       where {var} variables in the pattern are used for keys for the corresponding
+       path element.
+
+       Example:
+           match_path('/opt/{software}/bin', '/opt/mysoft/bin')
+           => { 'path' : '/opt/{software}/bin', 'software' : 'mysoft' }
+    """
+    class NoMatch(Exception):
+        pass
+
+    def match_element(pattern, s):
+        """If 'pattern' is a variable name, return the tuple (var, s), else None"""
+        var_re = '\{(\w+)\}'
+        m = re.match(var_re, pattern)
+        if m is not None:
+            return (m.groups()[0], s)
+        elif pattern != s:
+            raise NoMatch()
+
+    def is_not_none(x):
+        """Return True if x is not None"""
+        return x is not None
+
+    pattern_list = pattern.split(os.path.sep)
+    path_list = path.split(os.path.sep)
+    
+    try:
+        match = PathMatch(filter(is_not_none, map(match_element, pattern_list, path_list)))
+        match["path"] = path
+        match.match = len(path_list) == len(pattern_list)
+        match.incomplete_path = len(pattern_list) > len(path_list)
+        match.incomplete_pattern = len(path_list) > len(pattern_list)
+        return match
+    except NoMatch as nm:
+        return PathMatch()
+
+
+class EventHandler(pyinotify.ProcessEvent):
+    def __init__(self, watches, watchmanager, mask, room):
+        self.wm = watchmanager
+        self.dispatchers = {}
+        self.mask = mask
+        self.room = room
+
+        for watch in watches:
+            event = watch["event"].upper()
+            if not event in self.dispatchers.keys():
+                self.dispatchers[event] = []
+            self.dispatchers[event].append(watch)
+        print(self.dispatchers)
+
+    def process_IN_CREATE(self, event):
+        logging.debug("CREATE event: %s" % (event.pathname,))
+        for watch in self.dispatchers["CREATE"]:
+            match = match_path(watch["pattern"], event.pathname)
+            if match.match:
+                s = watch["text"].format(**match)
+                logging.info(s)
+                if self.room is not None:
+                    self.room.send_text(s)
+            elif match.incomplete_path:
+                self.wm.add_watch(event.pathname, self.mask, rec=False)
+
+    def process_event(self, event_type, event):
+        """Generic handler for other events"""
+        logging.debug("{} event: {}".format(event_type, event.pathname))
+        for watch in self.dispatchers[event_type]:
+            match = match_path(watch["pattern"], event.pathname)
+            if match.match:
+                s = watch["text"].format(**match)
+                logging.info(s)
+                if self.room is not None:
+                    self.room.send_text(s)
+
+    def process_IN_ACCESS(self, event):
+        self.process_event("ACCESS", event)
+
+    def process_IN_ATTRIB(self, event):
+        self.process_event("ATTRIB", event)
+
+    def process_IN_CLOSE_NOWRITE(self, event):
+        self.process_event("CLOSE_NOWRITE", event)
+
+    def process_IN_CLOSE_WRITE(self, event):
+        self.process_event("CLOSE_WRTE", event)
+
+    def process_IN_DELETE(self, event):
+        self.process_event("DELETE", event)
+
+    def process_IN_MODIFY(self, event):
+        self.process_event("MODIFY", event)
+
+    def process_IN_OPEN(self, event):
+        self.process_event("OPEN", event)
+
+
+def process_events(config, room):
+    eventtypes = {"ACCESS" : pyinotify.IN_ACCESS,
+                  "ATTRIB" : pyinotify.IN_ATTRIB,
+                  "CLOSE_NOWRITE" : pyinotify.IN_CLOSE_NOWRITE,
+                  "CLOSE_WRITE" : pyinotify.IN_CLOSE_WRITE,
+                  "CREATE" : pyinotify.IN_CREATE,
+                  "DELETE" : pyinotify.IN_DELETE,
+                  "MODIFY" : pyinotify.IN_MODIFY,
+                  "OPEN" : pyinotify.IN_OPEN}
+
+    mask = 0
+    for watch in config["watches"]:
+        mask = mask | eventtypes[watch["event"].upper()]
+
+    wm = pyinotify.WatchManager()
+    notifier = pyinotify.Notifier(wm, EventHandler(config["watches"], wm, mask, room))
+
+    for watch in config["watches"]:
+        for path in glob_pattern(watch["pattern"]):
+            logging.debug("watching {}".format(path))
+            wm.add_watch(path, mask, rec=False)
+
+    logging.info("Looping notifier")
+    notifier.loop()
+    logging.info("Done")
+
+
+def glob_pattern(pattern):
+   """Glob a pattern to paths that must be monitored to find new matching paths"""
+
+   var_re = '\{\w+\}'
+   v = []
+   for p in pattern.split(os.path.sep):
+       if re.match(var_re, p):
+           v.append("*")
+       elif len(v) > 0 and v[-1] != "*":
+           v[-1] += os.path.sep + p
+       else:
+           v.append(p)
+
+   paths = []
+   for i in range(1, len(v) + 1):
+       newpaths = os.path.sep.join(v[0:i])
+       paths.extend(glob.glob(newpaths))
+   return paths
+
+
+def on_message(room, event):
+    """Incomming messages from matrix. Log them and ignore them."""
+
+    if event['type'] == "m.room.member":                                             
+        if event['membership'] == "join":                                            
+            logging.debug("{0} joined".format(event['content']['displayname']))              
+    elif event['type'] == "m.room.message":                                          
+        if event['content']['msgtype'] == "m.text":                                  
+            logging.debug("{0}: {1}".format(event['sender'], event['content']['body']))      
+    else:                                                                            
+        logging.debug(event['type'])                                                         
+
+
+def matrix_connect(username, password, server, room):
+    """Connect to matrix server, and return the handle to a given room"""
+
+    client = MatrixClient(server)
+
+    room_id = room
+    try: 
+        client.login_with_password(username, password)
+    except MatrixRequestError as e:
+        logging.error(e)
+        if e.code == 403:
+            logging.error("Bad username or password.")
+            sys.exit(4)
+        else:
+            logging.error("Check your sever details are correct.")
+            sys.exit(2)
+    except MissingSchema as e:
+        logging.error("Bad URL format.")
+        logging.error(e)
+        sys.exit(3)
+    try:
+        room = client.join_room(room_id)
+    except MatrixRequestError as e:
+        logging.error(e)
+        if e.code == 400:
+            logging.error("Room ID/Alias in the wrong format")
+            sys.exit(11)
+        else:
+            logging.error("Couldn't find room.")
+            sys.exit(12)
+
+    room.add_listener(on_message)
+    client.start_listener_thread()
+
+    return room
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config_file", type=str)
+    parser.add_argument("-u", "--username", type=str, default=None,
+                        help="Matrix user name.")
+    parser.add_argument("-p", "--password", type=str, default=None,
+                        help="Matrix password.")
+    parser.add_argument("-s", "--server", type=str, default=None,
+                        help="Matrix homeserver URL.")
+    parser.add_argument("-r", "--room", type=str, default=None,
+                        help="Matrix room to notify.")
+    parser.add_argument("-l", "--loglevel", type=str, default=None,
+                        help="Loglevel. {DEBUG, INFO, WARNING, ERROR}")
+    parser.add_argument("--no-matrix", default=False, action="store_true",
+                        help="Do not connect to matrix. Events will stil be logged.")
+    return parser.parse_args()
+
+
+def main():
+    # Parse command line arguments
+    args = parse_args()
+
+    # Read configuration json file
+    config = json.load(open(args.config_file))
+
+    if not "matrix" in config.keys():
+        config["matrix"] = {}
+
+    # Override config parameters
+    if args.username is not None:
+        config["matrix"]["username"] = args.username
+    if args.password is not None:
+        config["matrix"]["password"] = args.password
+    if args.server is not None:
+        config["matrix"]["server"] = args.server
+    if args.room is not None:
+        config["matrix"]["room"] = args.room
+
+    if args.loglevel is not None:
+        config["loglevel"] = args.loglevel
+    if not "loglevel" in config.keys():
+        config["loglevel"] = logging.INFO
+
+    logging.basicConfig(level=config["loglevel"])
+    logging.info("Current configuration: {}".format(config))
+
+    if args.no_matrix:
+        logging.info("Disabling matrix connection for this run")
+        room = None
+    else:
+        room = matrix_connect(**config["matrix"])
+
+    process_events(config, room)
+    
+
+if __name__ == "__main__":
+    main()
+

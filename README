@@ -1,0 +1,28 @@
+Datasnok - Small write-only matrix bot for file system events
+=============================================================
+
+Datasnok is a small python script that uses inotify to detect file system
+events, and notifies a matrix room (see https://matrix.org/ ) about events on
+specific files. Considered it a small, write-only matrix bot.
+
+Dependencies
+------------
+
+ - python3
+ - matrix client library, found at https://github.com/matrix-org/matrix-python-sdk
+ - pyinotify 
+
+Configuration
+-------------
+
+Configuration is read from a json file at startup. See example-config.json for
+an example.
+
+Each watch is defined with a filename pattern, the event to watch for and the text
+to write to the channel when the event occurs. Handled events are:
+ACCESS, ATTRIB, CLOSE_NOWRITE, CLOSE_WRITE, CREATE, DELETE, MODIFY, OPEN
+
+The text can use variables from the filename pattern, plus {path} for the full path
+of the matched file.
+
+

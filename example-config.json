@@ -1,0 +1,27 @@
+{ 
+    "loglevel" : "INFO",
+    "matrix" : {
+        "server" :   "https://matrix.org/",
+        "username" : "some_username",
+        "password" : "my_supersecreet_password",
+	"room" :     "#test:matrix.org"
+    },
+
+    "watches" : [
+        {
+            "event" :   "create",
+            "pattern" : "/tmp/instruments/{instrument}/data/{fc}",
+            "text" :    "Sequencing started on {instrument} to path {path}"
+        },
+        {
+            "event" :   "delete",
+            "pattern" : "/tmp/instruments/{instrument}/data/{fc}",
+            "text" :    "Woops, what happened? Someone deleted {path}"
+        },
+        {
+            "event" :   "create",
+            "pattern" : "/tmp/instruments/{instrument}/data/{fc}/RTAComplete.txt",
+            "text" :    "Flowcell {fc} completed on {instrument}."
+        }
+    ]
+}
