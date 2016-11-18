@@ -74,14 +74,17 @@ class EventHandler(pyinotify.ProcessEvent):
             if not event in self.dispatchers.keys():
                 self.dispatchers[event] = []
             self.dispatchers[event].append(watch)
-        print(self.dispatchers)
 
     def process_IN_CREATE(self, event):
         logging.debug("CREATE event: %s" % (event.pathname,))
         for watch in self.dispatchers["CREATE"]:
             match = match_path(watch["pattern"], event.pathname)
             if match.match:
-                s = watch["text"].format(**match)
+                try:
+                    s = watch["text"].format(**match)
+                except KeyError as ke:
+                    logging.error("Cannot find key {}".format(ke))
+                    return
                 logging.info(s)
                 if self.room is not None:
                     self.room.send_text(s)
@@ -94,7 +97,11 @@ class EventHandler(pyinotify.ProcessEvent):
         for watch in self.dispatchers[event_type]:
             match = match_path(watch["pattern"], event.pathname)
             if match.match:
-                s = watch["text"].format(**match)
+                try:
+                    s = watch["text"].format(**match)
+                except KeyError as ke:
+                    logging.error("Cannot find key {}".format(ke))
+                    return
                 logging.info(s)
                 if self.room is not None:
                     self.room.send_text(s)
